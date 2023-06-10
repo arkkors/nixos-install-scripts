@@ -30,6 +30,10 @@
 #   being able to login without any authentication.
 # * The script reboots at the end.
 
+
+echo -n "CRYPTROOT_PASSWORD " && read -r -s CRYPTROOT_PASSWORD
+echo -n "SSH_KEY=" && read SSH_KEY
+
 set -eu
 set -o pipefail
 
@@ -82,8 +86,8 @@ echo -e "#! /usr/bin/env bash\nset -e\n" 'parted $@ 2> parted-stderr.txt || grep
 #   ... part-type is one of 'primary', 'extended' or 'logical', and may be specified only with 'msdos' or 'dvh' partition tables.
 #   A name must be specified for a 'gpt' partition table.
 # GPT partition names are limited to 36 UTF-16 chars, see https://en.wikipedia.org/wiki/GUID_Partition_Table#Partition_entries_(LBA_2-33).
-./parted-ignoring-partprobe-error.sh --script --align optimal /dev/sda -- mklabel gpt mkpart 'BIOS-boot-partition' 1MB 2MB set 1 bios_grub on mkpart 'data-partition' 2MB '100%'
-./parted-ignoring-partprobe-error.sh --script --align optimal /dev/sdb -- mklabel gpt mkpart 'BIOS-boot-partition' 1MB 2MB set 1 bios_grub on mkpart 'data-partition' 2MB '100%'
+./parted-ignoring-partprobe-error.sh --script --align optimal /dev/sda -- mklabel gpt mkpart 'BIOS-boot-partition' 1MB 4GB set 1 bios_grub on mkpart 'data-partition' 4GB '100%'
+./parted-ignoring-partprobe-error.sh --script --align optimal /dev/sdb -- mklabel gpt mkpart 'BIOS-boot-partition' 1MB 4GB set 1 bios_grub on mkpart 'data-partition' 4GB '100%'
 
 # Reload partitions
 partprobe
@@ -95,6 +99,8 @@ udevadm settle --timeout=5 --exit-if-exists=/dev/sdb1
 udevadm settle --timeout=5 --exit-if-exists=/dev/sdb2
 
 # Wipe any previous RAID signatures
+mdadm --zero-superblock --force /dev/sda1
+mdadm --zero-superblock --force /dev/sdb1
 mdadm --zero-superblock --force /dev/sda2
 mdadm --zero-superblock --force /dev/sdb2
 
@@ -108,7 +114,8 @@ mdadm --zero-superblock --force /dev/sdb2
 # Almost all details of this are explained in
 #   https://bugzilla.redhat.com/show_bug.cgi?id=606481#c14
 # and the followup comments by Doug Ledford.
-mdadm --create --run --verbose /dev/md0 --level=1 --raid-devices=2 --homehost=hetzner --name=root0 /dev/sda2 /dev/sdb2
+mdadm --create --run --verbose /dev/md0 --level=1 --raid-devices=2 --homehost=hetzner --name=boot0 /dev/sda1 /dev/sdb1
+mdadm --create --run --verbose /dev/md1 --level=1 --raid-devices=2 --homehost=hetzner --name=root0 /dev/sda2 /dev/sdb2
 
 # Assembling the RAID can result in auto-activation of previously-existing LVM
 # groups, preventing the RAID block device wiping below with
@@ -119,20 +126,30 @@ vgchange -an
 # possibly existing older use of the disks (RAID creation does not do that).
 # See https://serverfault.com/questions/911370/why-does-mdadm-zero-superblock-preserve-file-system-information
 wipefs -a /dev/md0
+wipefs -a /dev/md1
 
 # Disable RAID recovery. We don't want this to slow down machine provisioning
 # in the rescue mode. It can run in normal operation after reboot.
 echo 0 > /proc/sys/dev/raid/speed_limit_max
 
+# Setup LVM
+echo -n "$CRYPTROOT_PASSWORD" | cryptsetup luksFormat "--key-file=/dev/stdin" /dev/md1
+echo -n "$CRYPTROOT_PASSWORD" | cryptsetup luksOpen "--key-file=/dev/stdin" /dev/md1 cryptroot
+
+# Cleanup trap
+trap "vgchange -an; cryptsetup luksClose cryptroot" EXIT
+
+
 # LVM
 # PVs
-pvcreate /dev/md0
+pvcreate /dev/mapper/cryptroot
 # VGs
-vgcreate vg0 /dev/md0
+vgcreate vg0 /dev/mapper/cryptroot
 # LVs (--yes to automatically wipe detected file system signatures)
 lvcreate --yes --extents 95%FREE -n root0 vg0  # 5% slack space
 
 # Filesystems (-F to not ask on preexisting FS)
+mkfs.ext4 -F -L boot /dev/md0
 mkfs.ext4 -F -L root /dev/mapper/vg0-root0
 
 # Creating file systems changes their UUIDs.
@@ -148,6 +165,12 @@ udevadm settle --timeout=5 --exit-if-exists=/dev/disk/by-label/root
 
 # Mount target root partition
 mount /dev/disk/by-label/root /mnt
+mkdir --parents /mnt/boot /mnt/etc/secrets/initrd
+mount /dev/disk/by-label/boot /mnt/boot
+
+ssh-keygen -t rsa -N "" -f /mnt/etc/secrets/initrd/ssh_host_rsa_key
+ssh-keygen -t ed25519 -N "" -f /mnt/etc/secrets/initrd/ssh_host_ed25519_key
+
 
 # Installing nix
 
@@ -165,13 +188,10 @@ set +u +x # sourcing this may refer to unset variables that we have no control o
 set -u -x
 
 # FIXME Keep in sync with `system.stateVersion` set below!
-nix-channel --add https://nixos.org/channels/nixos-20.03 nixpkgs
+nix-channel --add https://nixos.org/channels/nixos-23.05 nixpkgs
 nix-channel --update
 
 # Getting NixOS installation tools
-nix-env -iE "_: with import <nixpkgs/nixos> { configuration = {}; }; with config.system.build; [ nixos-generate-config nixos-install nixos-enter manual.manpages ]"
-
-nixos-generate-config --root /mnt
 
 # Find the name of the network interface that connects us to the Internet.
 # Inspired by https://unix.stackexchange.com/questions/14961/how-to-find-out-which-interface-am-i-using-for-connecting-to-the-internet/302613#302613
@@ -204,6 +224,7 @@ echo "Determined DEFAULT_GATEWAY as $DEFAULT_GATEWAY"
 
 
 # Generate `configuration.nix`. Note that we splice in shell variables.
+mkdir --parents /mnt/etc/nixos
 cat > /mnt/etc/nixos/configuration.nix <<EOF
 { config, pkgs, ... }:
 
@@ -212,10 +233,31 @@ cat > /mnt/etc/nixos/configuration.nix <<EOF
     [ # Include the results of the hardware scan.
       ./hardware-configuration.nix
     ];
-
+# enp35s0
   # Use GRUB2 as the boot loader.
   # We don't use systemd-boot because Hetzner uses BIOS legacy boot.
   boot.loader.systemd-boot.enable = false;
+  boot.kernelParams = ["ip=$IP_V4::$DEFAULT_GATEWAY:255.255.255.0:hetzner:$NIXOS_INTERFACE:off"];
+  boot.initrd = {
+    availableKernelModules = [ "igb" ];
+    luks.forceLuksSupportInInitrd = true;
+    luks.devices = {
+      cryptroot = { device = "/dev/md/root0"; preLVM = true; };
+    };
+
+    network = {
+      enable = true;
+      ssh = {
+        enable = true;
+        authorizedKeys = config.users.users.root.openssh.authorizedKeys.keys;
+        hostKeys = [
+          "/etc/secrets/initrd/ssh_host_rsa_key"
+          "/etc/secrets/initrd/ssh_host_ed25519_key"
+        ];
+      };
+    };
+  };
+
   boot.loader.grub = {
     enable = true;
     efiSupport = false;
@@ -271,10 +313,7 @@ cat > /mnt/etc/nixos/configuration.nix <<EOF
   users.users.root.initialHashedPassword = "";
   services.openssh.permitRootLogin = "prohibit-password";
 
-  users.users.root.openssh.authorizedKeys.keys = [
-    # FIXME Replace this by your SSH pubkey!
-    "ssh-rsa AAAAAAAAAAA..."
-  ];
+  users.users.root.openssh.authorizedKeys.keys = [ "$SSH_KEY" ];
 
   services.openssh.enable = true;
 
@@ -283,14 +322,13 @@ cat > /mnt/etc/nixos/configuration.nix <<EOF
   # compatible, in order to avoid breaking some software such as database
   # servers. You should change this only after NixOS release notes say you
   # should.
-  system.stateVersion = "20.03"; # Did you read the comment?
-
+  system.stateVersion = "23.05"; # Did you read the comment?
 }
 EOF
 
 # Install NixOS
-PATH="$PATH" NIX_PATH="$NIX_PATH" `which nixos-install` --no-root-passwd --root /mnt --max-jobs 40
+nix-shell -p nixos-install-tools --run "nixos-generate-config --root /mnt && nixos-install --no-root-password --root /mnt --max-jobs 40"
 
 umount /mnt
 
-reboot
+echo "Done! Reboot the system to start your new installation"
